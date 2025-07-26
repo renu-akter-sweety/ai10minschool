@@ -1,0 +1,93 @@
+import os
+import pytesseract
+from pdf2image import convert_from_path
+from transformers import pipeline
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores.faiss import FAISS
+
+PDF_FILE = &quot;data/HSC26_Bangla_1st_paper.pdf&quot;
+OCR_OUTPUT = &quot;outputs/raw_text.txt&quot;
+CLEANED_OUTPUT = &quot;outputs/cleaned_text.txt&quot;
+INDEX_DIR = &quot;outputs/faiss_index&quot;
+
+def run_ocr(pdf_path, save_path, pages=60):
+print(&quot;Starting OCR...&quot;)
+images = convert_from_path(pdf_path, first_page=1, last_page=pages)
+os.makedirs(os.path.dirname(save_path), exist_ok=True)
+with open(save_path, &quot;w&quot;, encoding=&quot;utf-8&quot;) as f:
+for idx, img in enumerate(images, start=1):
+print(f&quot;�� Processing page {idx}&quot;)
+text = pytesseract.image_to_string(img, lang=&quot;ben&quot;)
+f.write(text + &quot;\n&quot;)
+print(f&quot;OCR completed. Output saved to {save_path}&quot;)
+
+def normalize_bengali_text(text):
+import re
+text = re.sub(r&quot;\s+&quot;, &quot; &quot;, text)
+text = re.sub(r&quot;[^\u0980-\u09FF\s।,!?]&quot;, &quot;&quot;, text)
+corrections = {
+&quot;অা&quot;: &quot;আ&quot;, &quot;াা&quot;: &quot;া&quot;, &quot;িি&quot;: &quot;ি&quot;, &quot;ুু&quot;: &quot;ু&quot;, &quot;ীী&quot;: &quot;ী&quot;, &quot;ংং&quot;: &quot;ং&quot;, &quot;।।&quot;: &quot;।&quot;,
+&quot;ক্ক&quot;: &quot;ক&quot;, &quot;ব্ব&quot;: &quot;ব&quot;, &quot;গ্গ&quot;: &quot;গ&quot;, &quot;ম্ম&quot;: &quot;ম&quot;, &quot;ণ্ণ&quot;: &quot;ণ&quot;, &quot;ৎৎ&quot;: &quot;ৎ&quot;,
+&quot;..&quot;: &quot;.&quot;, &quot;ঃঃ&quot;: &quot;ঃ&quot;
+}
+for wrong, right in corrections.items():
+text = text.replace(wrong, right)
+  return text.strip()
+
+def clean_text(raw_path, clean_path):
+with open(raw_path, &quot;r&quot;, encoding=&quot;utf-8&quot;) as f:
+raw_text = f.read()
+cleaned = normalize_bengali_text(raw_text)
+with open(clean_path, &quot;w&quot;, encoding=&quot;utf-8&quot;) as f:
+f.write(cleaned)
+print(f&quot;Cleaned text saved to {clean_path}&quot;)
+return cleaned
+
+def create_chunks(text, chunk_size=512, overlap=64):
+splitter = RecursiveCharacterTextSplitter(
+chunk_size=chunk_size,
+chunk_overlap=overlap,
+separators=[&quot;।&quot;, &quot;\n&quot;]
+)
+docs = splitter.create_documents([text])
+print(f&quot;Split into {len(docs)} chunks.&quot;)
+return docs
+
+def build_faiss_index(documents, output_dir):
+embeddings = HuggingFaceEmbeddings(
+model_name=&quot;sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2&quot;
+)
+vectorstore = FAISS.from_documents(documents, embeddings)
+vectorstore.save_local(output_dir)
+print(f&quot;FAISS index saved to {output_dir}&quot;)
+
+def load_index(index_dir):
+embeddings = HuggingFaceEmbeddings(
+model_name=&quot;sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2&quot;
+)
+return FAISS.load_local(index_dir, embeddings, allow_dangerous_deserialization=True)
+def answer_query(vectorstore, question, top_k=3):
+retriever = vectorstore.similarity_search(question, k=top_k)
+context = &quot; &quot;.join([doc.page_content for doc in retriever])
+qa = pipeline(&quot;question-answering&quot;, model=&quot;deepset/xlm-roberta-base-squad2&quot;)
+result = qa({&quot;question&quot;: question, &quot;context&quot;: context})
+print(&quot;Question:&quot;, question)
+print(&quot;�� Answer:&quot;, result[&#39;answer&#39;])
+print(&quot;\nTop Relevant Chunks:&quot;)
+for i, doc in enumerate(retriever, 1):
+print(f&quot;{i}) {doc.page_content[:200].strip()}...\n&quot;)
+return result[&quot;answer&quot;]
+
+if __name__ == &quot;__main__&quot;:
+# 1. Extract text using OCR
+run_ocr(PDF_FILE, OCR_OUTPUT)
+# 2. Clean and normalize the text
+cleaned_text = clean_text(OCR_OUTPUT, CLEANED_OUTPUT)
+# 3. Split text into chunks
+chunks = create_chunks(cleaned_text)
+# 4. Create FAISS index
+build_faiss_index(chunks, INDEX_DIR)
+# 5. Load index and answer a question
+vectorstore = load_index(INDEX_DIR)
+answer_query(vectorstore, &quot;কাকে অনুপমের ভাগ্য দেবতা বলে উল্লেখ করা হয়েছে?&quot;)
